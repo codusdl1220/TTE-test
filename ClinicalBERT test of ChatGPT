@@ -1,0 +1,307 @@
+# ========================================
+# 1. 필수 라이브러리 설치 및 임포트
+# ========================================
+!pip -q install transformers torch numpy python-docx
+
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+import re
+from docx import Document
+
+# ========================================
+# 2. ClinicalBERT 모델 로드
+# ========================================
+model_id = "medicalai/ClinicalBERT"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModel.from_pretrained(model_id)
+model.eval()
+print("✓ ClinicalBERT loaded successfully")
+
+# ========================================
+# 3. 7가지 필수 요소 정의
+# ========================================
+ELEMENTS_7 = [
+    "Eligibility Criteria",
+    "Treatment Strategies",
+    "Assignment Procedure",
+    "Follow-up Period",
+    "Outcome",
+    "Causal Contrasts",
+    "Analysis Plan",
+]
+
+# ========================================
+# 4. Word 문서에서 참조 데이터 추출
+# ========================================
+def squash(s):
+    """텍스트를 소문자 알파벳+숫자만 남기고 정규화"""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+def find_table_and_header(doc, max_scan_rows=40):
+    """Target Trial Specification 테이블 찾기"""
+    for ti, t in enumerate(doc.tables):
+        for r_idx in range(min(max_scan_rows, len(t.rows))):
+            row_text = " ".join([c.text for c in t.rows[r_idx].cells])
+            z = squash(row_text)
+            if ("studyfeature" in z and "hypotheticaltargettrial" in z 
+                and "targettrialemulation" in z):
+                return ti, r_idx
+    return None, None
+
+def extract_reference_from_docx(docx_path):
+    """Word 문서에서 참조 데이터 추출"""
+    doc = Document(docx_path)
+    ti, hr = find_table_and_header(doc)
+    
+    if ti is None:
+        raise ValueError("Target Trial Specification table not found in document")
+    
+    print(f"✓ Found table at index {ti}, header row {hr}")
+    
+    t = doc.tables[ti]
+    feature_map = {}
+    
+    for r in t.rows[hr+1:]:
+        cells = [c.text.strip().replace("\n", " ") for c in r.cells]
+        if len(cells) < 3:
+            continue
+        
+        feature = cells[0].strip()
+        ideal = cells[1].strip()
+        emul = cells[2].strip()
+        
+        if feature:
+            feature_map[feature] = (ideal, emul)
+    
+    print(f"✓ Extracted {len(feature_map)} features from document")
+    
+    # 7가지 요소로 매핑
+    def norm(s):
+        return re.sub(r"\s+", " ", (s or "").strip())
+    
+    def get(key):
+        return feature_map.get(key, ("", ""))
+    
+    ref_ideal = {k: "" for k in ELEMENTS_7}
+    ref_emul = {k: "" for k in ELEMENTS_7}
+    
+    # 1. Eligibility Criteria
+    a, b = get("Eligibility")
+    ref_ideal["Eligibility Criteria"] = a
+    ref_emul["Eligibility Criteria"] = b
+    
+    # 2. Treatment Strategies
+    a, b = get("Treatment arms")
+    ref_ideal["Treatment Strategies"] = a
+    ref_emul["Treatment Strategies"] = b
+    
+    # 3. Assignment Procedure
+    a1, b1 = get("Treatment assignment")
+    a2, b2 = get("Anchor point/Index date")
+    ref_ideal["Assignment Procedure"] = norm(f"{a1} {a2}")
+    ref_emul["Assignment Procedure"] = norm(f"{b1} {b2}")
+    
+    # 4. Follow-up Period
+    a, b = get("Follow up")
+    ref_ideal["Follow-up Period"] = a
+    ref_emul["Follow-up Period"] = b
+    
+    # 5. Outcome
+    a, b = get("Primary outcome")
+    ref_ideal["Outcome"] = a
+    ref_emul["Outcome"] = b
+    
+    # 6. Causal Contrasts
+    a, b = get("Causal contrast")
+    ref_ideal["Causal Contrasts"] = a
+    ref_emul["Causal Contrasts"] = b
+    
+    # 7. Analysis Plan
+    a_cov, b_cov = get("Covariates")
+    a_con, b_con = get("Confounding adjustment")
+    a_sta, b_sta = get("Statistical analysis")
+    ref_ideal["Analysis Plan"] = norm(f"{a_cov} {a_con} {a_sta}")
+    ref_emul["Analysis Plan"] = norm(f"{b_cov} {b_con} {b_sta}")
+    
+    return ref_ideal, ref_emul
+
+# ========================================
+# 5. ChatGPT 응답 데이터 (테이블 형식)
+# ========================================
+chatgpt_table = """
+| **Element**                 | **Target Trial Specification (Ideal Randomized Trial)**                                                                                                                                                                                                                                                                                                                                     | **Emulation Using Observational Data (Real-World Study)**                                                                                                                                                                                                                                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. Eligibility Criteria** | Adults (≥18 years) with a clinical diagnosis of moderate-to-severe asthma, inadequately controlled despite high-dose inhaled corticosteroids plus additional controller therapy. Eligible participants are biologic-naïve and meet biomarker or clinical eligibility for any of the three mAbs. Exclude patients with other primary pulmonary diseases or contraindications to study drugs. | Individuals identified from EHR or claims data with diagnostic codes for moderate-to-severe asthma, evidence of high-dose ICS plus controller use, and no prior use of asthma biologics during a predefined washout period. Exclusions applied using diagnosis codes for competing pulmonary conditions (e.g., COPD) and prior biologic exposure. |
+| **2. Treatment Strategies** | Initiation of one of three strategies at baseline: (a) omalizumab, (b) mepolizumab, or (c) dupilumab, administered per approved dosing schedules. Participants remain on the assigned biologic throughout follow-up unless discontinuation occurs.                                                                                                                                          | New-user design in which patients are classified based on first observed dispensing or administration of omalizumab, mepolizumab, or dupilumab. Treatment strategy defined as initiation of the specific biologic, regardless of subsequent switching or discontinuation (intention-to-treat–like approach).                                      |
+| **3. Assignment Procedure** | Random allocation at baseline in a 1:1:1 ratio to omalizumab, mepolizumab, or dupilumab, ensuring balance of measured and unmeasured confounders across groups.                                                                                                                                                                                                                             | Non-random treatment assignment determined by clinical practice. Confounding addressed using design and analytic strategies such as restriction to biologic-eligible patients and adjustment via propensity scores or inverse probability weighting.                                                                                              |
+| **4. Follow-up Period**     | Follow-up begins at randomization (t0) and continues for a fixed period (e.g., 12 months), until occurrence of outcome, treatment discontinuation, loss to follow-up, or end of study.                                                                                                                                                                                                      | Follow-up starts at biologic initiation date and continues for a predefined duration (e.g., up to 12 months), censoring at outcome occurrence, treatment switching/discontinuation (if per-protocol), disenrollment, death, or end of data availability.                                                                                          |
+| **5. Outcome**              | Primary outcome: rate of clinically significant asthma exacerbations (e.g., requiring systemic corticosteroids, emergency department visit, or hospitalization). Secondary outcomes may include asthma-related hospitalizations or oral corticosteroid use.                                                                                                                                 | Outcomes ascertained using validated algorithms based on diagnosis codes, procedure codes, medication fills (systemic corticosteroids), and healthcare utilization records within the observational dataset.                                                                                                                                      |
+| **6. Causal Contrasts**     | Intention-to-treat contrasts comparing the risk or rate of asthma exacerbations between treatment strategies: omalizumab vs mepolizumab, omalizumab vs dupilumab, and mepolizumab vs dupilumab.                                                                                                                                                                                             | Marginal treatment effects estimated to emulate intention-to-treat contrasts, comparing outcomes between biologic initiator groups after adjustment for baseline confounders.                                                                                                                                                                     |
+| **7. Analysis Plan**        | Primary analysis based on intention-to-treat. Use regression or survival models appropriate to outcome type. Randomization justifies unadjusted or minimally adjusted analyses.                                                                                                                                                                                                             | Use causal inference methods (e.g., propensity score weighting, matching, or multivariable regression) to adjust for baseline confounding. Time-to-event or count models used depending on outcome. Robust variance estimation applied. Sensitivity analyses may assess alternative censoring rules or per-protocol effects.                      |
+"""
+
+def parse_chatgpt_table(table_text):
+    """ChatGPT가 생성한 마크다운 테이블 파싱"""
+    chatgpt_ideal = {}
+    chatgpt_emul = {}
+    
+    lines = table_text.strip().split("\n")
+    
+    # 헤더와 구분선 건너뛰기
+    data_lines = [line for line in lines if line.strip() and not line.strip().startswith("|---")]
+    
+    # 첫 번째 줄은 헤더
+    header_line = data_lines[0] if data_lines else ""
+    
+    # 데이터 행 처리
+    for line in data_lines[1:]:  # 헤더 다음부터
+        if not line.strip() or line.strip().startswith("|---"):
+            continue
+        
+        # 파이프(|)로 분할
+        parts = [p.strip() for p in line.split("|")]
+        parts = [p for p in parts if p]  # 빈 요소 제거
+        
+        if len(parts) < 3:
+            continue
+        
+        element_name = parts[0].strip()
+        target_trial = parts[1].strip()
+        emulation = parts[2].strip()
+        
+        # 요소 번호와 별표 제거
+        element_name = re.sub(r'^\*\*\d+\.\s*', '', element_name)
+        element_name = element_name.replace('**', '').strip()
+        
+        # 7가지 표준 요소에 매핑
+        for standard_element in ELEMENTS_7:
+            if standard_element.lower() in element_name.lower():
+                chatgpt_ideal[standard_element] = target_trial
+                chatgpt_emul[standard_element] = emulation
+                break
+    
+    print(f"✓ Parsed {len(chatgpt_ideal)} elements from ChatGPT table")
+    
+    return chatgpt_ideal, chatgpt_emul
+
+# ========================================
+# 6. 임베딩 및 유사도 계산 함수
+# ========================================
+@torch.no_grad()
+def embed_meanpool(text, tokenizer, model, max_length=256):
+    """Mean pooling을 사용한 텍스트 임베딩"""
+    text = (text or "").strip()
+    if not text:
+        return np.zeros((model.config.hidden_size,), dtype=np.float32)
+    
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding=True
+    )
+    outputs = model(**inputs)
+    last_hidden = outputs.last_hidden_state
+    mask = inputs["attention_mask"].unsqueeze(-1)
+    masked = last_hidden * mask
+    summed = masked.sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1e-9)
+    emb = (summed / denom).squeeze(0).cpu().numpy().astype(np.float32)
+    return emb
+
+def cos_sim(a, b, eps=1e-9):
+    """코사인 유사도 계산"""
+    return float(np.dot(a, b) / ((np.linalg.norm(a) + eps) * (np.linalg.norm(b) + eps)))
+
+def sectionwise_scores(ref_dict, cand_dict, tokenizer, model, max_length=256, order=ELEMENTS_7):
+    """섹션별 유사도 점수 계산"""
+    per = {}
+    for k in order:
+        e1 = embed_meanpool(ref_dict.get(k, ""), tokenizer, model, max_length=max_length)
+        e2 = embed_meanpool(cand_dict.get(k, ""), tokenizer, model, max_length=max_length)
+        per[k] = cos_sim(e1, e2)
+    overall = float(np.mean(list(per.values())))
+    return per, overall
+
+# ========================================
+# 7. 메인 실행 코드
+# ========================================
+# Word 문서 경로 지정
+docx_path = "/1-s2.0-S0091674923001446-mmc10.docx"
+
+try:
+    # 참조 데이터 추출
+    print("=" * 60)
+    print("Extracting reference data from Word document...")
+    print("=" * 60)
+    ref_ideal, ref_emul = extract_reference_from_docx(docx_path)
+    
+    # ChatGPT 테이블 파싱
+    print("\n" + "=" * 60)
+    print("Parsing ChatGPT table...")
+    print("=" * 60)
+    chatgpt_ideal, chatgpt_emul = parse_chatgpt_table(chatgpt_table)
+    
+    # 파싱된 내용 확인 (디버깅용)
+    print("\n" + "=" * 60)
+    print("Parsed ChatGPT Elements Preview:")
+    print("=" * 60)
+    for k in ELEMENTS_7:
+        ideal_text = chatgpt_ideal.get(k, "")
+        emul_text = chatgpt_emul.get(k, "")
+        print(f"\n{k}:")
+        print(f"  Target Trial: {ideal_text[:100]}..." if len(ideal_text) > 100 else f"  Target Trial: {ideal_text}")
+        print(f"  Emulation: {emul_text[:100]}..." if len(emul_text) > 100 else f"  Emulation: {emul_text}")
+    
+    # 유사도 계산
+    print("\n" + "=" * 60)
+    print("Calculating similarity scores...")
+    print("=" * 60)
+    
+    # Ideal RCT column 비교
+    per_ideal, overall_ideal = sectionwise_scores(ref_ideal, chatgpt_ideal, tokenizer, model, max_length=256)
+    
+    # Observational emulation column 비교
+    per_emul, overall_emul = sectionwise_scores(ref_emul, chatgpt_emul, tokenizer, model, max_length=256)
+    
+    # 결과 출력
+    print("\n" + "=" * 60)
+    print("RESULTS: ChatGPT vs Reference (Target Trial Specification)")
+    print("=" * 60)
+    for k, v in per_ideal.items():
+        print(f"{k:25s} {v:.4f}")
+    print("-" * 60)
+    print(f"{'Overall Score':25s} {overall_ideal:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("RESULTS: ChatGPT vs Reference (Observational Emulation)")
+    print("=" * 60)
+    for k, v in per_emul.items():
+        print(f"{k:25s} {v:.4f}")
+    print("-" * 60)
+    print(f"{'Overall Score':25s} {overall_emul:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"Target Trial Specification Overall:    {overall_ideal:.4f}")
+    print(f"Observational Emulation Overall:       {overall_emul:.4f}")
+    print(f"Combined Average:                      {(overall_ideal + overall_emul)/2:.4f}")
+    
+    # 각 섹션별 평균 점수도 계산
+    print("\n" + "=" * 60)
+    print("SECTION-WISE AVERAGE SCORES")
+    print("=" * 60)
+    for k in ELEMENTS_7:
+        avg_score = (per_ideal[k] + per_emul[k]) / 2
+        print(f"{k:25s} {avg_score:.4f}")
+    
+except FileNotFoundError:
+    print(f"❌ Error: Word document not found at {docx_path}")
+    print("Please upload the reference document and update the docx_path variable")
+except Exception as e:
+    print(f"❌ Error occurred: {str(e)}")
+    import traceback
+    traceback.print_exc()
