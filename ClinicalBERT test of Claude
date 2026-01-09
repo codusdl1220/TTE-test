@@ -1,0 +1,524 @@
+# ========================================
+# 1. 필수 라이브러리 설치 및 임포트
+# ========================================
+!pip -q install transformers torch numpy python-docx
+
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+import re
+from docx import Document
+
+# ========================================
+# 2. ClinicalBERT 모델 로드
+# ========================================
+model_id = "medicalai/ClinicalBERT"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModel.from_pretrained(model_id)
+model.eval()
+print("✓ ClinicalBERT loaded successfully")
+
+# ========================================
+# 3. 7가지 필수 요소 정의
+# ========================================
+ELEMENTS_7 = [
+    "Eligibility Criteria",
+    "Treatment Strategies",
+    "Assignment Procedure",
+    "Follow-up Period",
+    "Outcome",
+    "Causal Contrasts",
+    "Analysis Plan",
+]
+
+# ========================================
+# 4. Word 문서에서 참조 데이터 추출
+# ========================================
+def squash(s):
+    """텍스트를 소문자 알파벳+숫자만 남기고 정규화"""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+def find_table_and_header(doc, max_scan_rows=40):
+    """Target Trial Specification 테이블 찾기"""
+    for ti, t in enumerate(doc.tables):
+        for r_idx in range(min(max_scan_rows, len(t.rows))):
+            row_text = " ".join([c.text for c in t.rows[r_idx].cells])
+            z = squash(row_text)
+            if ("studyfeature" in z and "hypotheticaltargettrial" in z 
+                and "targettrialemulation" in z):
+                return ti, r_idx
+    return None, None
+
+def extract_reference_from_docx(docx_path):
+    """Word 문서에서 참조 데이터 추출"""
+    doc = Document(docx_path)
+    ti, hr = find_table_and_header(doc)
+    
+    if ti is None:
+        raise ValueError("Target Trial Specification table not found in document")
+    
+    print(f"✓ Found table at index {ti}, header row {hr}")
+    
+    t = doc.tables[ti]
+    feature_map = {}
+    
+    for r in t.rows[hr+1:]:
+        cells = [c.text.strip().replace("\n", " ") for c in r.cells]
+        if len(cells) < 3:
+            continue
+        
+        feature = cells[0].strip()
+        ideal = cells[1].strip()
+        emul = cells[2].strip()
+        
+        if feature:
+            feature_map[feature] = (ideal, emul)
+    
+    print(f"✓ Extracted {len(feature_map)} features from document")
+    
+    # 7가지 요소로 매핑
+    def norm(s):
+        return re.sub(r"\s+", " ", (s or "").strip())
+    
+    def get(key):
+        return feature_map.get(key, ("", ""))
+    
+    ref_ideal = {k: "" for k in ELEMENTS_7}
+    ref_emul = {k: "" for k in ELEMENTS_7}
+    
+    # 1. Eligibility Criteria
+    a, b = get("Eligibility")
+    ref_ideal["Eligibility Criteria"] = a
+    ref_emul["Eligibility Criteria"] = b
+    
+    # 2. Treatment Strategies
+    a, b = get("Treatment arms")
+    ref_ideal["Treatment Strategies"] = a
+    ref_emul["Treatment Strategies"] = b
+    
+    # 3. Assignment Procedure
+    a1, b1 = get("Treatment assignment")
+    a2, b2 = get("Anchor point/Index date")
+    ref_ideal["Assignment Procedure"] = norm(f"{a1} {a2}")
+    ref_emul["Assignment Procedure"] = norm(f"{b1} {b2}")
+    
+    # 4. Follow-up Period
+    a, b = get("Follow up")
+    ref_ideal["Follow-up Period"] = a
+    ref_emul["Follow-up Period"] = b
+    
+    # 5. Outcome
+    a, b = get("Primary outcome")
+    ref_ideal["Outcome"] = a
+    ref_emul["Outcome"] = b
+    
+    # 6. Causal Contrasts
+    a, b = get("Causal contrast")
+    ref_ideal["Causal Contrasts"] = a
+    ref_emul["Causal Contrasts"] = b
+    
+    # 7. Analysis Plan
+    a_cov, b_cov = get("Covariates")
+    a_con, b_con = get("Confounding adjustment")
+    a_sta, b_sta = get("Statistical analysis")
+    ref_ideal["Analysis Plan"] = norm(f"{a_cov} {a_con} {a_sta}")
+    ref_emul["Analysis Plan"] = norm(f"{b_cov} {b_con} {b_sta}")
+    
+    return ref_ideal, ref_emul
+
+# ========================================
+# 5. Claude 응답 데이터 준비
+# ========================================
+# Claude가 생성한 Target Trial Specification Table을 여기에 붙여넣으세요
+claude_response = """
+# Target Trial Emulation Protocol: Comparative Effectiveness of Biologics in Moderate-to-Severe Asthma
+
+## Target Trial Specification Table
+
+### 1. ELIGIBILITY CRITERIA
+
+**Target Trial Specification:**
+- Adults (≥18 years) with moderate-to-severe asthma diagnosis
+- Currently receiving standard maintenance therapy (inhaled corticosteroids ± long-acting beta-agonists)
+- Eligible for biologic therapy per clinical guidelines (e.g., elevated eosinophils, IgE levels, or evidence of type 2 inflammation)
+- No contraindications to omalizumab, mepolizumab, or dupilumab
+- No prior biologic treatment for asthma
+- Adequate baseline assessment of asthma control and exacerbation history
+- Written informed consent provided
+
+**Emulation Using Observational Data:**
+- Identified patients aged ≥18 years with asthma diagnosis codes (ICD-10: J45.x) in electronic health records (EHR)
+- Required prescription records for inhaled corticosteroids in the 12 months before biologic initiation
+- Included patients with laboratory evidence of eligibility (eosinophil counts or IgE levels documented)
+- Excluded patients with prior biologic prescription claims for asthma
+- Index date defined as first prescription/administration of omalizumab, mepolizumab, or dupilumab
+- Required minimum 12-month baseline period with continuous enrollment/data availability before index date
+- Excluded patients with biologic prescriptions for other indications (e.g., chronic urticaria, chronic rhinosinusitis with nasal polyps)
+
+---
+
+### 2. TREATMENT STRATEGIES
+
+**Target Trial Specification:**
+- **Strategy 1:** Omalizumab (anti-IgE) administered subcutaneously every 2-4 weeks, dosed according to baseline IgE levels and body weight
+- **Strategy 2:** Mepolizumab (anti-IL-5) 100mg subcutaneously every 4 weeks
+- **Strategy 3:** Dupilumab (anti-IL-4Rα) 400mg or 600mg subcutaneously at baseline, then 200mg or 300mg every 2 weeks
+
+Treatment continued for minimum 12 months unless discontinued due to adverse events, loss of efficacy, or patient/physician decision. Concomitant asthma medications adjusted per standard clinical practice.
+
+**Emulation Using Observational Data:**
+- Treatment assignment based on first biologic prescription/administration recorded in claims data or EHR
+- Omalizumab: Identified by prescription claims or administration codes (J2357, 96372)
+- Mepolizumab: Identified by prescription claims or administration codes (J2182, 96401)
+- Dupilumab: Identified by prescription claims (Dupixent®, NDC codes)
+- Per-protocol analysis: Restricted to patients with evidence of at least 2 prescription fills/administrations in first 6 months
+- Intention-to-treat approach: All patients analyzed according to initial biologic assigned regardless of adherence or switching
+- Censored patients who switched biologics or discontinued without outcome
+
+---
+
+### 3. ASSIGNMENT PROCEDURE
+
+**Target Trial Specification:**
+- Randomized allocation (1:1:1) to omalizumab, mepolizumab, or dupilumab
+- Stratified randomization by:
+  - Baseline asthma severity (moderate vs. severe)
+  - Baseline eosinophil count (≥300 vs. <300 cells/μL)
+  - History of severe exacerbations in prior year (≥2 vs. <2)
+- Computer-generated random sequence with allocation concealment
+- Open-label design (blinding not feasible due to different administration schedules)
+- Baseline assessment conducted before randomization
+
+**Emulation Using Observational Data:**
+- Treatment assignment determined by clinical decision-making (physician and patient choice)
+- To emulate randomization, applied propensity score methods:
+  - Developed multinomial logistic regression model predicting treatment choice
+  - Included baseline covariates: age, sex, race/ethnicity, insurance type, comorbidity burden (Charlson index), baseline eosinophil count, IgE levels, FEV1% predicted, asthma control test scores, number of prior exacerbations, maintenance medication use, allergic comorbidities, smoking status
+  - Applied inverse probability of treatment weighting (IPTW) or 1:1:1 propensity score matching
+- Assessed covariate balance using standardized mean differences (target <0.10)
+- Clone-censor-weight approach considered to handle treatment-confounder feedback and informative censoring
+
+---
+
+### 4. FOLLOW-UP PERIOD
+
+**Target Trial Specification:**
+- Follow-up begins at randomization (time zero)
+- Primary analysis: 12-month follow-up period
+- Secondary analysis: Extended follow-up to 24 months if feasible
+- Scheduled assessments at months 3, 6, 9, 12 (and 18, 24 for extended follow-up)
+- Active surveillance for outcomes through medical record review and patient contact
+- Participants followed regardless of treatment adherence or discontinuation (intention-to-treat)
+- Loss to follow-up minimized through active retention strategies
+- Administrative censoring at end of study period
+
+**Emulation Using Observational Data:**
+- Follow-up begins at index date (first biologic prescription/administration)
+- Primary outcome window: 12 months post-index
+- Maximum follow-up: 24 months or until end of data availability (December 31, 2023)
+- Outcomes ascertained through:
+  - ICD-10 diagnosis codes for asthma exacerbations
+  - Prescription claims for oral corticosteroids
+  - Emergency department and hospitalization records
+  - Spirometry and asthma control assessments when available
+- Censoring events:
+  - End of continuous enrollment/insurance coverage
+  - Switch to different biologic or addition of second biologic
+  - Death
+  - End of data availability
+- Inverse probability of censoring weighting applied if censoring informative
+
+---
+
+### 5. OUTCOME
+
+**Target Trial Specification:**
+
+**Primary Outcome:**
+- Rate of clinically significant asthma exacerbations over 12 months, defined as:
+  - Worsening asthma requiring systemic corticosteroids for ≥3 days, OR
+  - Emergency department visit for asthma, OR
+  - Hospitalization for asthma
+
+**Secondary Outcomes:**
+- Rate of severe exacerbations (ED visit or hospitalization only)
+- Time to first exacerbation
+- Change in FEV1% predicted from baseline to 12 months
+- Change in Asthma Control Test (ACT) score
+- Annualized rate of oral corticosteroid courses
+- Adverse events leading to treatment discontinuation
+- Quality of life measures (AQLQ score)
+
+**Emulation Using Observational Data:**
+
+**Primary Outcome:**
+- Asthma exacerbations identified through validated algorithms:
+  - Oral/systemic corticosteroid prescription (≥3-day supply) + asthma diagnosis code within ±7 days, OR
+  - ED visit with primary/secondary asthma diagnosis (ICD-10: J45.x, J46), OR
+  - Hospitalization with primary asthma diagnosis
+- Exacerbations separated by ≥14 days considered distinct events
+
+**Secondary Outcomes:**
+- Severe exacerbations: ED visits or hospitalizations only
+- Time to first exacerbation calculated from index date
+- FEV1 measurements extracted when available (limited availability expected)
+- ACT scores extracted when documented
+- Oral corticosteroid use quantified through prescription claims
+- Treatment discontinuation identified by gap >90 days in prescription fills
+- Adverse events identified through diagnosis codes and treatment discontinuation patterns
+- All-cause healthcare utilization and costs
+
+---
+
+### 6. CAUSAL CONTRASTS
+
+**Target Trial Specification:**
+
+**Primary Contrasts:**
+- Omalizumab vs. Mepolizumab
+- Omalizumab vs. Dupilumab
+- Mepolizumab vs. Dupilumab
+
+**Effect Measures:**
+- Rate ratio (RR) for exacerbation rates with 95% confidence intervals
+- Risk difference per 100 person-years
+- Hazard ratio (HR) for time to first exacerbation
+- Mean difference for continuous outcomes (FEV1, ACT scores)
+
+**Subgroup Analyses (pre-specified):**
+- By baseline eosinophil count (<150, 150-299, ≥300 cells/μL)
+- By baseline IgE level (≤75, 76-700, >700 IU/mL)
+- By prior exacerbation frequency (≥2 vs. <2 in past year)
+- By asthma severity (moderate vs. severe)
+- By atopic comorbidities (allergic rhinitis, atopic dermatitis)
+
+**Emulation Using Observational Data:**
+
+**Primary Contrasts:**
+- Same three pairwise comparisons estimated using observational data
+- Intention-to-treat estimand: Effect of initiating each biologic regardless of adherence
+- Per-protocol estimand: Effect of sustained treatment adherence (sensitivity analysis)
+
+**Effect Measures:**
+- Adjusted rate ratios from negative binomial or Poisson regression models
+- Adjusted hazard ratios from Cox proportional hazards models
+- IPTW-adjusted risk differences and rate differences
+- Mean differences using linear regression with propensity score adjustment
+
+**Subgroup Analyses:**
+- Same pre-specified subgroups as target trial
+- Interaction terms tested in regression models
+- Stratified analyses conducted with sufficient sample sizes
+- Multiple testing adjustment applied (Bonferroni correction)
+
+---
+
+### 7. ANALYSIS PLAN
+
+**Target Trial Specification:**
+
+**Primary Analysis:**
+- Intention-to-treat principle: All randomized participants analyzed according to assigned treatment
+- Negative binomial regression for exacerbation rate ratios, adjusted for stratification variables
+- Cox proportional hazards model for time to first exacerbation
+- Linear mixed models for longitudinal continuous outcomes (FEV1, ACT scores)
+- Missing data handled via multiple imputation (assuming missing at random)
+- Two-sided significance level α=0.05
+- Power calculation: 300 patients per arm (900 total) provides 80% power to detect rate ratio of 0.70
+
+**Sensitivity Analyses:**
+- Per-protocol analysis (excluding protocol deviations)
+- Analysis adjusted for post-baseline covariates (time-varying confounders)
+- Complete case analysis (no imputation)
+- Multiple imputation under different assumptions
+
+**Statistical Software:** R version 4.x or SAS 9.4
+
+**Emulation Using Observational Data:**
+
+**Primary Analysis:**
+- Intention-to-treat emulation: Patients analyzed by initial biologic choice
+- Inverse probability of treatment weighting (IPTW) to balance baseline confounders
+  - Weights calculated from multinomial propensity score model
+  - Weights truncated at 1st and 99th percentiles to reduce extreme values
+- Weighted negative binomial regression for rate ratios
+- Weighted Cox regression for hazard ratios
+- Robust sandwich estimators for standard errors accounting for weighting
+
+**Alternative Approaches:**
+1. Propensity score matching (1:1:1 with caliper 0.1)
+2. Multivariable regression adjustment
+3. Doubly robust estimation combining outcome regression and propensity scores
+4. G-computation for standardized risks
+
+**Handling Time-Varying Confounding:**
+- Clone-censor-weight approach if treatment switching occurs
+- Marginal structural models with time-varying IPTW if indicated
+- Censoring at treatment switch in per-protocol analysis
+
+**Sensitivity Analyses:**
+- Varying definitions of exposure and outcome
+- Different propensity score specifications
+- Alternative censoring assumptions
+- Restriction to patients with more complete data
+- Quantitative bias analysis for unmeasured confounding (E-values)
+- Falsification tests using negative control outcomes
+
+**Missing Data:**
+- Pattern-mixture models if missing not at random suspected
+- Multiple imputation with sensitivity to departures from MAR
+- Complete case analysis as sensitivity check
+
+**Statistical Software:** R 4.x (packages: WeightIt, cobalt, survival, MASS, MatchIt)
+"""
+
+def parse_claude_response(text):
+    """Claude 응답에서 7가지 요소 추출"""
+    claude_ideal = {}
+    claude_emul = {}
+    
+    # 각 섹션별로 파싱
+    sections = text.split("###")
+    
+    for section in sections:
+        if not section.strip():
+            continue
+        
+        # 섹션 제목 찾기
+        lines = section.strip().split("\n")
+        title = lines[0].strip()
+        
+        # Target Trial Specification과 Emulation Using Observational Data 분리
+        target_trial_text = []
+        emulation_text = []
+        current_mode = None
+        
+        for line in lines[1:]:
+            if "**Target Trial Specification:**" in line:
+                current_mode = "target"
+                continue
+            elif "**Emulation Using Observational Data:**" in line:
+                current_mode = "emulation"
+                continue
+            elif line.startswith("**") and line.endswith(":**"):
+                # 하위 섹션 헤더는 건너뛰기
+                continue
+            elif line.startswith("---"):
+                break
+            
+            if current_mode == "target" and line.strip():
+                target_trial_text.append(line.strip())
+            elif current_mode == "emulation" and line.strip():
+                emulation_text.append(line.strip())
+        
+        # 7가지 요소에 매핑
+        for element in ELEMENTS_7:
+            if element.upper() in title.upper() or element.replace(" ", "").upper() in title.replace(" ", "").upper():
+                claude_ideal[element] = " ".join(target_trial_text)
+                claude_emul[element] = " ".join(emulation_text)
+                break
+    
+    return claude_ideal, claude_emul
+
+# ========================================
+# 6. 임베딩 및 유사도 계산 함수
+# ========================================
+@torch.no_grad()
+def embed_meanpool(text, tokenizer, model, max_length=256):
+    """Mean pooling을 사용한 텍스트 임베딩"""
+    text = (text or "").strip()
+    if not text:
+        return np.zeros((model.config.hidden_size,), dtype=np.float32)
+    
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+        padding=True
+    )
+    outputs = model(**inputs)
+    last_hidden = outputs.last_hidden_state
+    mask = inputs["attention_mask"].unsqueeze(-1)
+    masked = last_hidden * mask
+    summed = masked.sum(dim=1)
+    denom = mask.sum(dim=1).clamp(min=1e-9)
+    emb = (summed / denom).squeeze(0).cpu().numpy().astype(np.float32)
+    return emb
+
+def cos_sim(a, b, eps=1e-9):
+    """코사인 유사도 계산"""
+    return float(np.dot(a, b) / ((np.linalg.norm(a) + eps) * (np.linalg.norm(b) + eps)))
+
+def sectionwise_scores(ref_dict, cand_dict, tokenizer, model, max_length=256, order=ELEMENTS_7):
+    """섹션별 유사도 점수 계산"""
+    per = {}
+    for k in order:
+        e1 = embed_meanpool(ref_dict.get(k, ""), tokenizer, model, max_length=max_length)
+        e2 = embed_meanpool(cand_dict.get(k, ""), tokenizer, model, max_length=max_length)
+        per[k] = cos_sim(e1, e2)
+    overall = float(np.mean(list(per.values())))
+    return per, overall
+
+# ========================================
+# 7. 메인 실행 코드
+# ========================================
+# Word 문서 경로 지정 (업로드된 파일 경로로 수정 필요)
+docx_path = "/1-s2.0-S0091674923001446-mmc10.docx"
+
+try:
+    # 참조 데이터 추출
+    print("=" * 60)
+    print("Extracting reference data from Word document...")
+    print("=" * 60)
+    ref_ideal, ref_emul = extract_reference_from_docx(docx_path)
+    
+    # Claude 응답 파싱
+    print("\n" + "=" * 60)
+    print("Parsing Claude response...")
+    print("=" * 60)
+    claude_ideal, claude_emul = parse_claude_response(claude_response)
+    print(f"✓ Parsed {len(claude_ideal)} elements from Claude response")
+    
+    # 유사도 계산
+    print("\n" + "=" * 60)
+    print("Calculating similarity scores...")
+    print("=" * 60)
+    
+    # Ideal RCT column 비교
+    per_ideal, overall_ideal = sectionwise_scores(ref_ideal, claude_ideal, tokenizer, model, max_length=256)
+    
+    # Observational emulation column 비교
+    per_emul, overall_emul = sectionwise_scores(ref_emul, claude_emul, tokenizer, model, max_length=256)
+    
+    # 결과 출력
+    print("\n" + "=" * 60)
+    print("RESULTS: Claude vs Reference (Target Trial Specification)")
+    print("=" * 60)
+    for k, v in per_ideal.items():
+        print(f"{k:25s} {v:.4f}")
+    print("-" * 60)
+    print(f"{'Overall Score':25s} {overall_ideal:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("RESULTS: Claude vs Reference (Observational Emulation)")
+    print("=" * 60)
+    for k, v in per_emul.items():
+        print(f"{k:25s} {v:.4f}")
+    print("-" * 60)
+    print(f"{'Overall Score':25s} {overall_emul:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"Target Trial Specification Overall:    {overall_ideal:.4f}")
+    print(f"Observational Emulation Overall:       {overall_emul:.4f}")
+    print(f"Combined Average:                      {(overall_ideal + overall_emul)/2:.4f}")
+    
+except FileNotFoundError:
+    print(f"❌ Error: Word document not found at {docx_path}")
+    print("Please upload the reference document and update the docx_path variable")
+except Exception as e:
+    print(f"❌ Error occurred: {str(e)}")
+    import traceback
+    traceback.print_exc()
